@@ -16,7 +16,8 @@ class Quote():
     algorithm is not tuned to trade.
     """
 
-    def __init__(self):
+    def __init__(self, symbol):
+        self._symbol = symbol
         self.prev_bid = 0
         self.prev_ask = 0
         self.prev_spread = 0
@@ -55,6 +56,7 @@ class Quote():
             self.prev_spread = round(self.prev_ask - self.prev_bid, 3)
             self.spread = round(self.ask - self.bid, 3)
             print(
+                self._symbol,
                 'Level change:', self.prev_bid, self.prev_ask,
                 self.prev_spread, self.bid, self.ask, self.spread, flush=True
             )
@@ -73,7 +75,8 @@ class Position():
     sell as well as how many have been filled into our account.
     """
 
-    def __init__(self):
+    def __init__(self, symbol):
+        self._symbol = symbol
         self.orders_filled_amount = {}
         self.pending_buy_shares = 0
         self.pending_sell_shares = 0
@@ -107,39 +110,50 @@ class Position():
     def update_total_shares(self, quantity):
         self.total_shares += quantity
 
+    def sync(self, position, open_orders):
+        if position is None:
+            self.total_shares = 0
+        else:
+            self.total_shares = position.qty
 
-def run(args):
-    symbol = args.symbol
-    max_shares = args.quantity
-    opts = {}
-    if args.key_id:
-        opts['key_id'] = args.key_id
-    if args.secret_key:
-        opts['secret_key'] = args.secret_key
-    if args.base_url:
-        opts['base_url'] = args.base_url
-    elif 'key_id' in opts and opts['key_id'].startswith('PK'):
-        opts['base_url'] = 'https://paper-api.alpaca.markets'
-    # Create an API object which can be used to submit orders, etc.
-    api = tradeapi.REST(**opts)
+        if not open_orders:
+            self.pending_buy_shares = 0
+            self.pending_sell_shares = 0
+        else:
+            self.pending_buy_shares = sum([o.qty - o.filled_qty for o in open_orders if o.side == 'buy'])
+            self.pending_sell_shares = sum([o.qty - o.filled_qty for o in open_orders if o.side != 'buy'])
 
-    symbol = symbol.upper()
-    quote = Quote()
-    qc = 'Q.%s' % symbol
-    tc = 'T.%s' % symbol
-    position = Position()
-    unit = args.unit
 
-    # Establish streaming connection
-    conn = tradeapi.StreamConn(**opts)
+def print_status(positions):
+    items = {}
+    df = pd.DataFrame({
+        symbol: {'pendig_buy': p.pending_buy_shares, 'pending_sell': p.pending_sell_shares, 'total_shares': p.total_shares}
+    for symbol, p in positions.items()})
+    print(df.T)
+
+
+def setup(api, conn, symbols, unit, max_shares):
+
+    quotes = {}
+    positions = {}
+    posdata = {pos.symbol: pos for pos in api.list_positions()}
+    open_orders = api.list_orders()
+    for symbol in symbols:
+        quotes[symbol] = Quote(symbol)
+        positions[symbol] = Position(symbol)
+        positions[symbol].sync(posdata.get(symbol),
+            [o for o in open_orders if o.symbol == symbol])
+
+    print_status(positions)
 
     # Define our message handling
-    @conn.on(r'Q\.' + symbol)
+    @conn.on(r'Q\..*')
     async def on_quote(conn, channel, data):
         # Quote update received
+        quote = quotes[channel[2:]]
         quote.update(data)
 
-    @conn.on(r'T\.' + symbol)
+    @conn.on(r'T\..*')
     async def on_trade(conn, channel, data):
         t = pd.Timestamp.now(tz='America/New_York')
         if not(
@@ -147,8 +161,12 @@ def run(args):
             t.time() >= pd.Timestamp('09:40').time() and
             t.time() <= pd.Timestamp('12:40').time()):
             return
+        symbol = channel[2:]
+        quote = quotes[symbol]
         if quote.traded:
             return
+
+        position = positions[symbol]
 
         # We've received a trade and might be ready to follow it
         if (
@@ -183,10 +201,10 @@ def run(args):
                     api.cancel_order(o.id)
                     position.update_pending_buy_shares(unit)
                     position.orders_filled_amount[o.id] = 0
-                    print('Buy at', quote.ask, flush=True)
+                    print(symbol, 'Buy at', quote.ask, flush=True)
                     quote.traded = True
                 except Exception as e:
-                    print(e)
+                    print(symbol, e)
             elif (
                 data.price == quote.bid
                 and quote.ask_size > (quote.bid_size * 1.8)
@@ -205,16 +223,20 @@ def run(args):
                     api.cancel_order(o.id)
                     position.update_pending_sell_shares(unit)
                     position.orders_filled_amount[o.id] = 0
-                    print('Sell at', quote.bid, flush=True)
+                    print(symbol, 'Sell at', quote.bid, flush=True)
                     quote.traded = True
                 except Exception as e:
-                    print(e)
+                    print(symbol, e)
 
     @conn.on(r'trade_updates')
     async def on_trade_updates(conn, channel, data):
         # We got an update on one of the orders we submitted. We need to
         # update our position with the new information.
         event = data.event
+        symbol = data.order['symbol']
+        position = positions.get(symbol)
+        if position is None:
+            log.warning(f'position not found for {symbol}')
         if event == 'fill':
             if data.order['side'] == 'buy':
                 position.update_total_shares(
@@ -237,16 +259,39 @@ def run(args):
                 data.order['id'], data.order['side'], unit,
             )
 
-    conn.run(
-        ['trade_updates', tc, qc]
-    )
+
+def run(args):
+    symbols = [s.upper() for s in args.symbols.split(',')]
+    max_shares = args.quantity
+    opts = {}
+    if args.key_id:
+        opts['key_id'] = args.key_id
+    if args.secret_key:
+        opts['secret_key'] = args.secret_key
+    if args.base_url:
+        opts['base_url'] = args.base_url
+    elif 'key_id' in opts and opts['key_id'].startswith('PK'):
+        opts['base_url'] = 'https://paper-api.alpaca.markets'
+    # Create an API object which can be used to submit orders, etc.
+    api = tradeapi.REST(**opts)
+
+    qc = ['Q.' + symbol for symbol in symbols]
+    tc = ['T.' + symbol for symbol in symbols]
+    unit = args.unit
+
+    # Establish streaming connection
+    conn = tradeapi.StreamConn(**opts)
+
+    setup(api, conn, symbols, unit, max_shares)
+
+    conn.run(['trade_updates'] + tc + qc)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--symbol', type=str, default='SNAP',
-        help='Symbol you want to trade.'
+        '--symbols', type=str, default='SNAP',
+        help='Comman-separated symbols you want to trade.'
     )
     parser.add_argument(
         '--unit', type=int, default=100,
