@@ -230,7 +230,9 @@ def setup(api, conn, symbols, unit, max_shares):
                     api.cancel_order(o.id)
                     position.update_pending_buy_shares(unit)
                     position.orders_filled_amount[o.id] = 0
-                    slog.msg('buy at', s=symbol, ask=quote.ask)
+                    slog.msg('buy at', s=symbol, ask=quote.ask,
+                             total_shares=position.total_shares,
+                             pending_buy=position.pending_buy_shares)
                     quote.traded = True
                 except Exception as e:
                     slog.msg('error on buy', s=symbol, error=str(e))
@@ -252,7 +254,9 @@ def setup(api, conn, symbols, unit, max_shares):
                     api.cancel_order(o.id)
                     position.update_pending_sell_shares(unit)
                     position.orders_filled_amount[o.id] = 0
-                    slog.msg('sell at', s=symbol, bid=quote.bid)
+                    slog.msg('sell at', s=symbol, bid=quote.bid,
+                             total_shares=position.total_shares,
+                             pending_sell=position.pending_sell_shares)
                     quote.traded = True
                 except Exception as e:
                     slog.msg('error on sell', s=symbol, error=str(e))
@@ -268,13 +272,15 @@ def setup(api, conn, symbols, unit, max_shares):
             slog.msg('position not found', s=symbol)
         if event == 'fill':
             slog.msg('filled', s=symbol, **data.order)
+            old_amount = position.orders_filled_amount[data.order['id']]
+            new_amount = int(data.order['filled_qty'])
             if data.order['side'] == 'buy':
                 position.update_total_shares(
-                    int(data.order['filled_qty'])
+                    new_amount - old_amount
                 )
             else:
                 position.update_total_shares(
-                    -1 * int(data.order['filled_qty'])
+                    old_amount - new_amount
                 )
             position.remove_pending_order(
                 data.order['id'], data.order['side'], unit,
