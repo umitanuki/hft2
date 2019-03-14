@@ -2,6 +2,26 @@ import argparse
 import pandas as pd
 import numpy as np
 import alpaca_trade_api as tradeapi
+import structlog
+
+
+def modify_msg(_, __, msg):
+    t = pd.Timestamp.now(tz='America/New_York').isoformat()
+    event = msg.pop('event', None)
+    s = msg.pop('s', None)
+    d = dict(t=t, event=event, s=s, **msg)
+    if not event:
+        del d['event']
+    if not s:
+        del d['s']
+    return d
+
+
+structlog.configure(
+    processors=[
+        modify_msg,
+        structlog.processors.JSONRenderer()])
+slog = structlog.get_logger()
 
 
 class Quote():
@@ -55,11 +75,15 @@ class Quote():
             # Update spreads
             self.prev_spread = round(self.prev_ask - self.prev_bid, 3)
             self.spread = round(self.ask - self.bid, 3)
-            print(
-                self._symbol,
-                'Level change:', self.prev_bid, self.prev_ask,
-                self.prev_spread, self.bid, self.ask, self.spread, flush=True
-            )
+            slog.msg('level change',
+                     s=self._symbol,
+                     prev_bid=self.prev_bid,
+                     prev_ask=self.prev_ask,
+                     prev_spread=self.prev_spread,
+                     bid=self.bid,
+                     ask=self.ask,
+                     spread=self.spread,
+                     )
             # If change is from one penny spread level to a different penny
             # spread level, then initialize for new level (reset stale vars)
             if self.prev_spread == 0.01:
@@ -120,15 +144,17 @@ class Position():
             self.pending_buy_shares = 0
             self.pending_sell_shares = 0
         else:
-            self.pending_buy_shares = sum([o.qty - o.filled_qty for o in open_orders if o.side == 'buy'])
-            self.pending_sell_shares = sum([o.qty - o.filled_qty for o in open_orders if o.side != 'buy'])
+            self.pending_buy_shares = sum(
+                [o.qty - o.filled_qty for o in open_orders if o.side == 'buy'])
+            self.pending_sell_shares = sum(
+                [o.qty - o.filled_qty for o in open_orders if o.side != 'buy'])
 
 
 def print_status(positions):
-    items = {}
-    df = pd.DataFrame({
-        symbol: {'pendig_buy': p.pending_buy_shares, 'pending_sell': p.pending_sell_shares, 'total_shares': p.total_shares}
-    for symbol, p in positions.items()})
+    df = pd.DataFrame({symbol: {'pendig_buy': p.pending_buy_shares,
+                                'pending_sell': p.pending_sell_shares,
+                                'total_shares': p.total_shares} for symbol,
+                       p in positions.items()})
     print(df.T)
 
 
@@ -142,28 +168,31 @@ def setup(api, conn, symbols, unit, max_shares):
         quotes[symbol] = Quote(symbol)
         positions[symbol] = Position(symbol)
         positions[symbol].sync(posdata.get(symbol),
-            [o for o in open_orders if o.symbol == symbol])
+                               [o for o in open_orders if o.symbol == symbol])
 
     print_status(positions)
 
     # Define our message handling
     @conn.on(r'Q\..*')
     async def on_quote(conn, channel, data):
+        slog.msg('Q', s=channel[2:], **data._raw)
         # Quote update received
         quote = quotes[channel[2:]]
         quote.update(data)
 
     @conn.on(r'T\..*')
     async def on_trade(conn, channel, data):
+        slog.msg('T', s=channel[2:], **data._raw)
         t = pd.Timestamp.now(tz='America/New_York')
         if not(
-            0 <= t.dayofweek <= 5 and
-            t.time() >= pd.Timestamp('09:40').time() and
-            t.time() <= pd.Timestamp('12:40').time()):
+                0 <= t.dayofweek <= 5 and
+                t.time() >= pd.Timestamp('09:40').time() and
+                t.time() <= pd.Timestamp('12:40').time()):
             return
         symbol = channel[2:]
         quote = quotes[symbol]
         if quote.traded:
+            slog.msg('quote.traded', s=symbol)
             return
 
         position = positions[symbol]
@@ -201,10 +230,10 @@ def setup(api, conn, symbols, unit, max_shares):
                     api.cancel_order(o.id)
                     position.update_pending_buy_shares(unit)
                     position.orders_filled_amount[o.id] = 0
-                    print(symbol, 'Buy at', quote.ask, flush=True)
+                    slog.msg('buy at', s=symbol, ask=quote.ask)
                     quote.traded = True
                 except Exception as e:
-                    print(symbol, e)
+                    slog.msg('error on buy', s=symbol, error=str(e))
             elif (
                 data.price == quote.bid
                 and quote.ask_size > (quote.bid_size * 1.8)
@@ -223,10 +252,10 @@ def setup(api, conn, symbols, unit, max_shares):
                     api.cancel_order(o.id)
                     position.update_pending_sell_shares(unit)
                     position.orders_filled_amount[o.id] = 0
-                    print(symbol, 'Sell at', quote.bid, flush=True)
+                    slog.msg('sell at', s=symbol, bid=quote.bid)
                     quote.traded = True
                 except Exception as e:
-                    print(symbol, e)
+                    slog.msg('error on sell', s=symbol, error=str(e))
 
     @conn.on(r'trade_updates')
     async def on_trade_updates(conn, channel, data):
@@ -236,8 +265,9 @@ def setup(api, conn, symbols, unit, max_shares):
         symbol = data.order['symbol']
         position = positions.get(symbol)
         if position is None:
-            log.warning(f'position not found for {symbol}')
+            slog.msg('position not found', s=symbol)
         if event == 'fill':
+            slog.msg('filled', s=symbol, **data.order)
             if data.order['side'] == 'buy':
                 position.update_total_shares(
                     int(data.order['filled_qty'])
@@ -250,6 +280,7 @@ def setup(api, conn, symbols, unit, max_shares):
                 data.order['id'], data.order['side'], unit,
             )
         elif event == 'partial_fill':
+            slog.msg('partially_filled', s=symbol, **data.order)
             position.update_filled_amount(
                 data.order['id'], int(data.order['filled_qty']),
                 data.order['side']
@@ -315,4 +346,5 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
     assert args.quantity >= 100
+
     run(args)
