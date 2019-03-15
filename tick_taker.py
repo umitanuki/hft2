@@ -138,16 +138,16 @@ class Position():
         if position is None:
             self.total_shares = 0
         else:
-            self.total_shares = position.qty
+            self.total_shares = int(position.qty)
 
         if not open_orders:
             self.pending_buy_shares = 0
             self.pending_sell_shares = 0
         else:
             self.pending_buy_shares = sum(
-                [o.qty - o.filled_qty for o in open_orders if o.side == 'buy'])
+                [int(o.qty) - int(o.filled_qty or 0) for o in open_orders if o.side == 'buy'])
             self.pending_sell_shares = sum(
-                [o.qty - o.filled_qty for o in open_orders if o.side != 'buy'])
+                [int(o.qty) - int(o.filled_qty or 0) for o in open_orders if o.side != 'buy'])
 
 
 def print_status(positions):
@@ -158,20 +158,30 @@ def print_status(positions):
     print(df.T)
 
 
+def sync_state(api, symbols, positions):
+    posdata = {pos.symbol: pos for pos in api.list_positions()}
+    open_orders = api.list_orders(limit=500)
+    for symbol in symbols:
+        positions[symbol].sync(posdata.get(symbol),
+                               [o for o in open_orders if o.symbol == symbol])
+
+
 def setup(api, conn, symbols, unit, max_shares):
 
     quotes = {}
     positions = {}
-    posdata = {pos.symbol: pos for pos in api.list_positions()}
-    open_orders = api.list_orders()
     for symbol in symbols:
         quotes[symbol] = Quote(symbol)
         positions[symbol] = Position(symbol)
-        positions[symbol].sync(posdata.get(symbol),
-                               [o for o in open_orders if o.symbol == symbol])
+
+    sync_state(api, symbols, positions)
 
     print_status(positions)
 
+    class Timer(object): pass
+
+    timer = Timer()
+    timer.last_sync = pd.Timestamp.now(tz='America/New_York')
     # Define our message handling
     @conn.on(r'Q\..*')
     async def on_quote(conn, channel, data):
@@ -187,8 +197,11 @@ def setup(api, conn, symbols, unit, max_shares):
         if not(
                 0 <= t.dayofweek <= 5 and
                 t.time() >= pd.Timestamp('09:40').time() and
-                t.time() <= pd.Timestamp('12:40').time()):
+                t.time() <= pd.Timestamp('15:40').time()):
             return
+        if t - timer.last_sync >= pd.Timedelta('30s'):
+            sync_state(api, symbols, positions)
+            timer.last_sync = t
         symbol = channel[2:]
         quote = quotes[symbol]
         if quote.traded:
@@ -205,6 +218,7 @@ def setup(api, conn, symbols, unit, max_shares):
         ):
             # The trade came too close to the quote update
             # and may have been for the previous level
+            slog.msg('too close', s=symbol, trade_t=data.timestamp.isoformat(), quote_t=quote.time.isoformat(), delta=quote.time - data.timestamp)
             return
         if data.size >= 100:
             # The trade was large enough to follow, so we check to see if
@@ -212,6 +226,10 @@ def setup(api, conn, symbols, unit, max_shares):
             # bid vs ask quantities (order book imbalance) indicate
             # a movement in that direction. We also want to be sure that
             # we're not buying or selling more than we should.
+            if data.price == quote.ask:
+                slog.msg('trade at ask', s=symbol, bidsize=quote.bid_size, asksize=quote.ask_size)
+            elif data.price == quote.bid:
+                slog.msg('trade at bid', s=symbol, bidsize=quote.bid_size, asksize=quote.ask_size)
             if (
                 data.price == quote.ask
                 and quote.bid_size > (quote.ask_size * 1.8)
@@ -238,21 +256,22 @@ def setup(api, conn, symbols, unit, max_shares):
                     slog.msg('error on buy', s=symbol, error=str(e))
             elif (
                 data.price == quote.bid
-                and quote.ask_size > (quote.bid_size * 1.8)
+                # and quote.ask_size >= (quote.bid_size * 1.0)
                 and (
                     position.total_shares - position.pending_sell_shares
                 ) >= unit
             ):
                 # Everything looks right, so we submit our sell at the bid
                 try:
+                    qty = position.total_shares
                     o = api.submit_order(
-                        symbol=symbol, qty=unit, side='sell',
+                        symbol=symbol, qty=qty, side='sell',
                         type='limit', time_in_force='day',
                         limit_price=str(quote.bid)
                     )
                     # Approximate an IOC order by immediately cancelling
                     api.cancel_order(o.id)
-                    position.update_pending_sell_shares(unit)
+                    position.update_pending_sell_shares(qty)
                     position.orders_filled_amount[o.id] = 0
                     slog.msg('sell at', s=symbol, bid=quote.bid,
                              total_shares=position.total_shares,
@@ -263,6 +282,7 @@ def setup(api, conn, symbols, unit, max_shares):
 
     @conn.on(r'trade_updates')
     async def on_trade_updates(conn, channel, data):
+        slog.msg('trade_update', type=data.event)
         # We got an update on one of the orders we submitted. We need to
         # update our position with the new information.
         event = data.event
@@ -283,7 +303,7 @@ def setup(api, conn, symbols, unit, max_shares):
                     old_amount - new_amount
                 )
             position.remove_pending_order(
-                data.order['id'], data.order['side'], unit,
+                data.order['id'], data.order['side'], data.order['qty'],
             )
         elif event == 'partial_fill':
             slog.msg('partially_filled', s=symbol, **data.order)
@@ -293,7 +313,7 @@ def setup(api, conn, symbols, unit, max_shares):
             )
         elif event == 'canceled' or event == 'rejected':
             position.remove_pending_order(
-                data.order['id'], data.order['side'], unit,
+                data.order['id'], data.order['side'], data.order['qty'],
             )
 
 
